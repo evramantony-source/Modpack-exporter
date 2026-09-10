@@ -1,11 +1,13 @@
 package com.evramantony.modpackexporter
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -16,7 +18,13 @@ import java.util.zip.ZipInputStream
 
 class MainActivity : AppCompatActivity() {
     private lateinit var status: TextView
+    private var selectedUri: Uri? = null
     private val pickCode = 1001
+    private val saveCode = 1002
+    private var pendingExport: ExportType? = null
+    private var pendingMetadata: ModpackExporter.Metadata? = null
+
+    private enum class ExportType { MRPACK, ZIP }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -34,7 +42,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "Phase 1 • Import & inspect ZIP / MRPACK"
+            text = "Phase 2 • Real export engine"
             textSize = 16f
             gravity = Gravity.CENTER
             setPadding(0, 12, 0, 32)
@@ -42,6 +50,20 @@ class MainActivity : AppCompatActivity() {
         val pick = Button(this).apply {
             text = "📦  SELECT MODPACK"
             setOnClickListener { openPicker() }
+        }
+        val mrpack = Button(this).apply {
+            text = "EXPORT AS MODRINTH .MRPACK"
+            isEnabled = false
+            setOnClickListener { beginMrpackExport() }
+        }
+        val zip = Button(this).apply {
+            text = "EXPORT AS NORMAL .ZIP"
+            isEnabled = false
+            setOnClickListener { beginExport(ExportType.ZIP) }
+        }
+        val curse = Button(this).apply {
+            text = "EXPORT AS CURSEFORGE ZIP (NEXT)"
+            isEnabled = false
         }
         status = TextView(this).apply {
             text = "Select a .zip or .mrpack file to begin."
@@ -51,27 +73,40 @@ class MainActivity : AppCompatActivity() {
         root.addView(title)
         root.addView(subtitle)
         root.addView(pick)
+        root.addView(mrpack)
+        root.addView(zip)
+        root.addView(curse)
         root.addView(status)
         val scroll = ScrollView(this).apply { addView(root) }
         setContentView(scroll)
+
+        exportButtons = listOf(mrpack, zip)
     }
+
+    private lateinit var exportButtons: List<Button>
 
     private fun openPicker() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/zip"
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream"))
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/zip", "application/octet-stream", "application/x-zip-compressed"))
         }
         startActivityForResult(intent, pickCode)
     }
 
-    @Deprecated("Activity result API kept minimal for Phase 1")
+    @Deprecated("Activity result API kept compatible with Phase 1")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode != pickCode || resultCode != RESULT_OK || data?.data == null) return
-        val uri = data.data!!
-        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        inspect(uri)
+        if (requestCode == pickCode && resultCode == RESULT_OK && data?.data != null) {
+            val uri = data.data!!
+            runCatching {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            selectedUri = uri
+            inspect(uri)
+        } else if (requestCode == saveCode && resultCode == RESULT_OK && data?.data != null) {
+            saveExport(data.data!!)
+        }
     }
 
     private fun inspect(uri: Uri) {
@@ -81,7 +116,98 @@ class MainActivity : AppCompatActivity() {
                 onSuccess = { it },
                 onFailure = { "❌ Could not inspect archive: ${it.message ?: "unknown error"}" }
             )
-            runOnUiThread { status.text = result }
+            runOnUiThread {
+                status.text = result
+                val ok = result.startsWith("✅")
+                exportButtons.forEach { it.isEnabled = ok }
+            }
+        }.start()
+    }
+
+    private fun beginMrpackExport() {
+        val name = queryName(selectedUri!!)?.substringBeforeLast('.')?.ifBlank { "My Modpack" } ?: "My Modpack"
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 8, 48, 0)
+        }
+        val nameInput = EditText(this).apply { setText(name); hint = "Pack name" }
+        val mcInput = EditText(this).apply { hint = "Minecraft version (e.g. 1.21.1)" }
+        val loaderInput = EditText(this).apply { hint = "Loader (fabric / forge / neoforge / quilt)" }
+        val loaderVersionInput = EditText(this).apply { hint = "Loader version (optional)" }
+        layout.addView(nameInput)
+        layout.addView(mcInput)
+        layout.addView(loaderInput)
+        layout.addView(loaderVersionInput)
+        AlertDialog.Builder(this)
+            .setTitle("MRPACK metadata")
+            .setMessage("Generic ZIP files need Minecraft metadata. Existing MRPACK files keep their index.")
+            .setView(layout)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Continue") { _, _ ->
+                val loader = loaderInput.text.toString().trim().lowercase()
+                if (nameInput.text.isBlank() || mcInput.text.isBlank() || loader.isBlank()) {
+                    status.text = "❌ Pack name, Minecraft version, and loader are required."
+                    return@setPositiveButton
+                }
+                pendingMetadata = ModpackExporter.Metadata(
+                    nameInput.text.toString().trim(),
+                    mcInput.text.toString().trim(),
+                    loader,
+                    loaderVersionInput.text.toString().trim()
+                )
+                beginExport(ExportType.MRPACK)
+            }
+            .show()
+    }
+
+    private fun beginExport(type: ExportType) {
+        if (selectedUri == null) {
+            status.text = "❌ Select a modpack first."
+            return
+        }
+        pendingExport = type
+        val base = queryName(selectedUri!!) ?: "modpack.zip"
+        val name = when (type) {
+            ExportType.MRPACK -> base.substringBeforeLast('.') + ".mrpack"
+            ExportType.ZIP -> base.substringBeforeLast('.') + "-export.zip"
+        }
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/zip"
+            putExtra(Intent.EXTRA_TITLE, name)
+        }
+        startActivityForResult(intent, saveCode)
+    }
+
+    private fun saveExport(destination: Uri) {
+        val inputUri = selectedUri ?: return
+        val type = pendingExport ?: return
+        status.text = "Exporting…"
+        exportButtons.forEach { it.isEnabled = false }
+        Thread {
+            val result = runCatching {
+                contentResolver.openInputStream(inputUri)?.use { input ->
+                    contentResolver.openOutputStream(destination)?.use { output ->
+                        when (type) {
+                            ExportType.MRPACK -> ModpackExporter.exportMrpack(input, output, pendingMetadata!!)
+                            ExportType.ZIP -> ModpackExporter.exportZip(input, output)
+                        }
+                    } ?: throw IllegalArgumentException("Unable to create output file")
+                } ?: throw IllegalArgumentException("Unable to open selected file")
+
+                if (type == ExportType.MRPACK) {
+                    contentResolver.openInputStream(destination)?.use { ModpackExporter.validateMrpack(it) }
+                        ?: throw IllegalArgumentException("Unable to verify exported MRPACK")
+                }
+                "✅ Export complete!\n\nSaved successfully and verified."
+            }.fold(
+                onSuccess = { it },
+                onFailure = { "❌ Export failed: ${it.message ?: "unknown error"}" }
+            )
+            runOnUiThread {
+                status.text = result
+                exportButtons.forEach { it.isEnabled = selectedUri != null }
+            }
         }.start()
     }
 
@@ -102,11 +228,8 @@ class MainActivity : AppCompatActivity() {
                     val entry: ZipEntry = zip.nextEntry ?: break
                     entries++
                     val path = entry.name.replace('\\', '/')
-                    if (path.startsWith("/") || path.split('/').contains("..") || Regex("^[A-Za-z]:").containsMatchIn(path)) {
-                        unsafe = true
-                    }
+                    if (path.startsWith("/") || path.split('/').contains("..") || Regex("^[A-Za-z]:").containsMatchIn(path)) unsafe = true
                     if (entry.isDirectory) continue
-                    val rootPath = path.substringAfterLast('/', path)
                     if (path == "modrinth.index.json" || path.endsWith("/modrinth.index.json")) hasMrpackIndex = true
                     if (path == "manifest.json" || path.endsWith("/manifest.json")) hasCurseManifest = true
                     if (path.startsWith("mods/") || path.contains("/mods/")) hasMods = true
@@ -119,7 +242,7 @@ class MainActivity : AppCompatActivity() {
                         if (n <= 0) break
                         read += n
                         if (read > 512L * 1024L * 1024L || totalUncompressed > 2L * 1024L * 1024L * 1024L) {
-                            throw IllegalArgumentException("Archive expands beyond the Phase 1 safety limit")
+                            throw IllegalArgumentException("Archive expands beyond the safety limit")
                         }
                     }
                     totalUncompressed += read
@@ -133,22 +256,20 @@ class MainActivity : AppCompatActivity() {
             hasCurseManifest -> "CurseForge-style ZIP"
             else -> "Generic ZIP"
         }
-        val warning = if (unsafe) "\n⚠️ Unsafe archive paths detected." else ""
         return buildString {
             append("✅ Archive opened successfully\n\n")
-            append("File: $name\n")
-            append("Detected: $type\n")
-            append("Entries: $entries\n")
+            append("File: $name\nDetected: $type\nEntries: $entries\n")
             append("Mods: ${if (hasMods) "found" else "not found"}\n")
             append("Config: ${if (hasConfig) "found" else "not found"}\n")
             append("Overrides: ${if (hasOverrides) "found" else "not found"}\n")
             append("Uncompressed data: ${totalUncompressed / (1024 * 1024)} MiB")
-            append(warning)
-            append("\n\nPhase 1 import engine is working. Exporters come next.")
+            if (unsafe) append("\n⚠️ Unsafe archive paths detected.")
+            append("\n\nReady for export.")
         }
     }
 
-    private fun queryName(uri: Uri): String? {
+    private fun queryName(uri: Uri?): String? {
+        if (uri == null) return null
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) return c.getString(0)
         }
