@@ -160,14 +160,14 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun beginExport(type: ExportType) {
+    private fun beginExport(exportType: ExportType) {
         if (selectedUri == null) {
             status.text = "❌ Select a modpack first."
             return
         }
-        pendingExport = type
+        pendingExport = exportType
         val base = queryName(selectedUri!!) ?: "modpack.zip"
-        val name = when (type) {
+        val name = when (exportType) {
             ExportType.MRPACK -> base.substringBeforeLast('.') + ".mrpack"
             ExportType.ZIP -> base.substringBeforeLast('.') + "-export.zip"
         }
